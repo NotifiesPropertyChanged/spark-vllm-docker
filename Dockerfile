@@ -72,11 +72,6 @@ ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 # Setup Workspace
 WORKDIR $VLLM_BASE_DIR
 
-# Build NCCL with mesh support (TODO: only do it if arch is 12.1) - artifacts will be in /workspace/nccl/build/pkg/deb
-# RUN git clone -b dgxspark-3node-ring https://github.com/zyang-dev/nccl.git && \
-#     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
-#     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
-
 RUN git clone -b v2.30u1 https://github.com/NVIDIA/nccl.git && \
     cd nccl && make -j ${BUILD_JOBS} src.build NVCC_GENCODE="-gencode=arch=compute_121,code=sm_121" && \
     make pkg.debian.build && apt install -y --no-install-recommends --allow-downgrades ./build/pkg/deb/*.deb
@@ -138,16 +133,6 @@ RUN if [ -n "$FLASHINFER_PRS" ]; then \
         done; \
     fi
 
-# TEMPORARY patch for flashinfer autotune and other improvements (PR 2927) - MERGED 4/3
-# RUN curl -fsL https://github.com/flashinfer-ai/flashinfer/pull/2927.diff -o pr2927.diff \
-#     && if git apply --reverse --check pr2927.diff 2>/dev/null; then \
-#          echo "PR #2927 already applied, skipping."; \
-#        else \
-#          echo "Applying FI PR #2927..."; \
-#          git apply -v pr2927.diff; \
-#        fi \
-#     && rm pr2927.diff
-
 # Apply patch to avoid re-downloading existing cubins
 COPY flashinfer_cache.patch .
 RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -172,7 +157,59 @@ FROM scratch AS flashinfer-export
 COPY --from=flashinfer-builder /workspace/wheels /
 
 # =========================================================
-# STAGE 4: vLLM Builder
+# STAGE 4: b12x Builder
+# =========================================================
+FROM base AS b12x-builder
+
+WORKDIR $VLLM_BASE_DIR
+
+# --- B12X SOURCE CACHE BUSTER ---
+ARG CACHEBUST_B12X=1
+
+ARG B12X_REPO=https://github.com/lukealonso/b12x.git
+ARG B12X_REF=dev/sparse_mla_unified
+
+# Additional deps
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    uv pip install cuda-tile==1.3.0 "nvidia-cutlass-dsl[cu13]==4.5.2" nvidia-cutlass-dsl-libs-base==4.5.2 nvidia-cutlass-dsl-libs-cu13==4.5.2 packaging
+
+# Smart Git Clone & Build for b12x
+RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
+    cd /repo-cache && \
+    if [ ! -d "b12x" ]; then \
+        echo "Cache miss: Cloning b12x from scratch..." && \
+        git clone --recursive ${B12X_REPO} b12x; \
+        if [ "$B12X_REF" != "main" ]; then \
+            cd b12x && git checkout ${B12X_REF}; \
+        fi; \
+    else \
+        echo "Cache hit: Fetching b12x updates..." && \
+        cd b12x && \
+        git remote set-url origin ${B12X_REPO} && \
+        git fetch origin && \
+        git fetch origin --tags --force && \
+        (git checkout --detach origin/${B12X_REF} 2>/dev/null || git checkout ${B12X_REF}) && \
+        git submodule update --init --recursive && \
+        git clean -fdx && \
+        git gc --auto; \
+    fi && \
+    cp -a /repo-cache/b12x /workspace/b12x
+
+WORKDIR /workspace/b12x
+
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
+    --mount=type=cache,id=ccache,target=/root/.ccache \
+    uv build --no-build-isolation --wheel . --out-dir=/workspace/wheels -v && \
+    git rev-parse HEAD > /workspace/wheels/.b12x-commit
+
+# =========================================================
+# STAGE 5: b12x Wheel Export
+# =========================================================
+FROM scratch AS b12x-export
+COPY --from=b12x-builder /workspace/wheels /
+
+# =========================================================
+# STAGE 6: vLLM Builder
 # =========================================================
 FROM base AS vllm-builder
 
@@ -185,23 +222,34 @@ ARG CACHEBUST_VLLM=1
 
 # Git reference (branch, tag, or SHA) to checkout
 ARG VLLM_REF=main
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
 
 # Smart Git Clone (Fetch changes instead of full re-clone)
 RUN --mount=type=cache,id=repo-cache,target=/repo-cache \
     cd /repo-cache && \
     if [ ! -d "vllm" ]; then \
         echo "Cache miss: Cloning vLLM from scratch..." && \
-        git clone --recursive https://github.com/vllm-project/vllm.git; \
+        git clone --recursive ${VLLM_REPO} vllm; \
         if [ "$VLLM_REF" != "main" ]; then \
             cd vllm && \
-            git checkout ${VLLM_REF}; \
+            case "${VLLM_REF}" in \
+                refs/heads/*) git checkout --detach "origin/${VLLM_REF#refs/heads/}" ;; \
+                refs/pull/*/head) git fetch origin "${VLLM_REF}:FETCH_HEAD" && git checkout --detach FETCH_HEAD ;; \
+                *) git checkout --detach "origin/${VLLM_REF}" 2>/dev/null || git checkout --detach "${VLLM_REF}" 2>/dev/null || git checkout "${VLLM_REF}" ;; \
+            esac; \
         fi; \
     else \
         echo "Cache hit: Fetching updates..." && \
         cd vllm && \
-        git fetch origin && \
-        git fetch origin --tags --force && \
-        (git checkout --detach origin/${VLLM_REF} 2>/dev/null || git checkout ${VLLM_REF}) && \
+        (git cherry-pick --abort >/dev/null 2>&1 || true) && \
+        git reset --hard && \
+        git remote set-url origin ${VLLM_REPO} && \
+        git fetch origin "+refs/heads/*:refs/remotes/origin/*" --tags --force && \
+        case "${VLLM_REF}" in \
+            refs/heads/*) git checkout --detach "origin/${VLLM_REF#refs/heads/}" ;; \
+            refs/pull/*/head) git fetch origin "${VLLM_REF}:FETCH_HEAD" && git checkout --detach FETCH_HEAD ;; \
+            *) git checkout --detach "origin/${VLLM_REF}" 2>/dev/null || git checkout --detach "${VLLM_REF}" 2>/dev/null || git checkout "${VLLM_REF}" ;; \
+        esac && \
         git submodule update --init --recursive && \
         git clean -fdx && \
         git gc --auto; \
@@ -224,16 +272,6 @@ RUN if [ -n "$VLLM_PRS" ]; then \
             git merge pr-${pr} --no-edit; \
         done; \
     fi
-
-# # TEMPORARY PATCH for broken FP8 kernels - https://github.com/vllm-project/vllm/pull/35568
-# RUN curl -fsL https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/35568.diff -o pr35568.diff \
-#     && if git apply --reverse --check pr35568.diff 2>/dev/null; then \
-#          echo "PR 35568 already applied, skipping."; \
-#        else \
-#          echo "Applying PR 35568..."; \
-#          git apply -v --exclude="tests/*" pr35568.diff; \
-#        fi \
-#     && rm pr35568.diff
 
 # TEMPORARY PATCH: revert vLLM PR #41524 / commit c51df430,
 # which disables FlashInfer autotune and regresses DGX Spark throughput.
@@ -286,18 +324,6 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     sed -i '/^fastsafetensors\b/d' requirements/test/cuda.txt && \
     uv pip install -r requirements/build/cuda.txt
 
-# Apply Patches
-# TEMPORARY PATCH for fastsafetensors loading in cluster setup - tracking https://github.com/vllm-project/vllm/issues/34180
-# COPY fastsafetensors.patch .
-# RUN if patch -p1 --dry-run --reverse < fastsafetensors.patch &>/dev/null; then \
-#         echo "PR #34180 is already applied"; \
-#     else \
-#         patch -p1 < fastsafetensors.patch; \
-#     fi
-# TEMPORARY PATCH for broken vLLM build (unguarded Hopper code) - reverting PR #34758 and #34302
-# RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34758.diff | patch -p1 -R || echo "Cannot revert PR #34758, skipping"
-# RUN curl -L https://patch-diff.githubusercontent.com/raw/vllm-project/vllm/pull/34302.diff | patch -p1 -R || echo "Cannot revert PR #34302, skipping"
-
 # Final Compilation
 RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
@@ -306,13 +332,13 @@ RUN --mount=type=cache,id=ccache,target=/root/.ccache \
     git rev-parse HEAD > /workspace/wheels/.vllm-commit
 
 # =========================================================
-# STAGE 5: vLLM Wheel Export
+# STAGE 7: vLLM Wheel Export
 # =========================================================
 FROM scratch AS vllm-export
 COPY --from=vllm-builder /workspace/wheels /
 
 # =========================================================
-# STAGE 6: Runner (Installs wheels from host ./wheels/)
+# STAGE 8: Runner (Installs wheels from host ./wheels/)
 # =========================================================
 FROM nvidia/cuda:13.2.0-devel-ubuntu24.04 AS runner
 
@@ -385,7 +411,6 @@ ENV TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 ENV TIKTOKEN_ENCODINGS_BASE=$VLLM_BASE_DIR/tiktoken_encodings
 ENV PATH=$VLLM_BASE_DIR:$PATH
 
-
 # Final extra deps
 # Pin torch via --override so transitive deps (e.g. instanttensor) can't trigger
 # a re-resolve that swaps the CUDA-built torch for PyPI's CPU wheel.
@@ -398,6 +423,6 @@ RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
 # Fix NCCL
 RUN rm /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2 && \
     ln -s /usr/lib/aarch64-linux-gnu/libnccl.so.2 /usr/local/lib/python3.12/dist-packages/nvidia/nccl/lib/libnccl.so.2
-    
+
 # Build metadata (generated by build-and-copy.sh)
 COPY build-metadata.yaml /workspace/build-metadata.yaml

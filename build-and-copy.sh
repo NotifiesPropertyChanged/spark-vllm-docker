@@ -19,6 +19,8 @@ VLLM_REF="main"
 VLLM_REF_SET=false
 FLASHINFER_REF="main"
 FLASHINFER_REF_SET=false
+VLLM_REPO="https://github.com/vllm-project/vllm.git"
+VLLM_REPO_SET=false
 TMP_IMAGE=""
 PARALLEL_COPY=false
 EXP_MXFP4=false
@@ -56,6 +58,7 @@ generate_build_metadata() {
     local pre_transformers="$6"
     local exp_mxfp4="$7"
     local vllm_prs="$8"
+    local vllm_repo="${9:-https://github.com/vllm-project/vllm.git}"
 
     local base_image
     base_image=$(grep -m1 '^FROM .* AS runner' "$dockerfile" | awk '{print $2}')
@@ -69,6 +72,7 @@ flashinfer_commit: ${flashinfer_commit:-unknown}
 gpu_arch: ${GPU_ARCH_LIST}
 base_image: ${base_image:-unknown}
 build_args:
+  vllm_repo: ${vllm_repo}
   vllm_ref: ${vllm_ref}
   transformers_5: ${pre_transformers}
   exp_mxfp4: ${exp_mxfp4}
@@ -372,6 +376,7 @@ usage() {
     echo "  --gpu-arch <arch>             : GPU architecture (default: '12.1a')"
     echo "  --rebuild-flashinfer          : Force rebuild of FlashInfer wheels (ignore cached wheels)"
     echo "  --rebuild-vllm                : Force rebuild of vLLM wheels (ignore cached wheels)"
+    echo "  --vllm-repo <url>             : vLLM git repository URL (default: 'https://github.com/vllm-project/vllm.git')"
     echo "  --force-flashinfer-download   : Force download of FlashInfer wheels (skip cached wheel checks)"
     echo "  --force-vllm-download         : Force download of vLLM wheels (skip cached wheel checks)"
     echo "  --force-download              : Force download of all prebuilt wheels (skip cached wheel checks)"
@@ -404,6 +409,7 @@ while [[ "$#" -gt 0 ]]; do
         --gpu-arch) GPU_ARCH_LIST="$2"; shift ;;
         --rebuild-flashinfer) REBUILD_FLASHINFER=true ;;
         --rebuild-vllm) REBUILD_VLLM=true ;;
+        --vllm-repo) VLLM_REPO="$2"; VLLM_REPO_SET=true; shift ;;
         --force-flashinfer-download) FORCE_FLASHINFER_DOWNLOAD=true ;;
         --force-vllm-download) FORCE_VLLM_DOWNLOAD=true ;;
         --force-download)
@@ -524,6 +530,10 @@ fi
 # Validate flag combinations
 if [ -n "$VLLM_PRS" ]; then
     if [ "$EXP_MXFP4" = true ]; then echo "Error: --apply-vllm-pr is incompatible with --exp-mxfp4"; exit 1; fi
+fi
+
+if [ "$VLLM_REPO_SET" = true ]; then
+    if [ "$EXP_MXFP4" = true ]; then echo "Error: --vllm-repo is incompatible with --exp-mxfp4"; exit 1; fi
 fi
 
 if [ -n "$FLASHINFER_PRS" ]; then
@@ -677,7 +687,7 @@ if [ "$NO_BUILD" = false ]; then
         # ----------------------------------------------------------
         # Phase 2: vLLM wheels
         # ----------------------------------------------------------
-        if [ "$VLLM_REF_SET" = true ] || [ -n "$VLLM_PRS" ]; then
+        if [ "$VLLM_REF_SET" = true ] || [ "$VLLM_REPO_SET" = true ] || [ -n "$VLLM_PRS" ]; then
             REBUILD_VLLM=true
         fi
 
@@ -714,6 +724,7 @@ if [ "$NO_BUILD" = false ]; then
                 "--target" "vllm-export"
                 "--output" "type=local,dest=./wheels"
                 "${COMMON_BUILD_FLAGS[@]}"
+                "--build-arg" "VLLM_REPO=$VLLM_REPO"
                 "--build-arg" "VLLM_REF=$VLLM_REF")
 
             if [ "$REBUILD_VLLM" = true ]; then
